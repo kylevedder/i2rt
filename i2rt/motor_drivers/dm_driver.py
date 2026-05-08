@@ -446,14 +446,13 @@ class DMChainCanInterface(MotorChain):
 
             self.absolute_positions = None
             self._motor_on()
-        starting_command = []
-        for motor_state in self.state:
-            starting_command.append(MotorCmd(torque=motor_state.torque))
+        starting_command = [MotorCmd() for _ in self.state]
         logging.info(f"Initializing motorchain with starting command: {starting_command}")
         self.commands = starting_command
         self.command_lock = threading.RLock()
 
-        self.start_thread_flag = start_thread
+        self.start_thread_flag = False
+        self._thread = None
         if start_thread:
             self.start_thread()
 
@@ -522,8 +521,8 @@ class DMChainCanInterface(MotorChain):
         if self.start_thread_flag:
             return
         logging.info("starting separate thread for control loop")
-        thread = threading.Thread(target=self._set_torques_and_update_state)
-        thread.start()
+        self._thread = threading.Thread(target=self._set_torques_and_update_state)
+        self._thread.start()
         self.start_thread_flag = True
         time.sleep(0.1)
         while self.state is None:
@@ -734,6 +733,8 @@ class DMChainCanInterface(MotorChain):
 
     def close(self) -> None:
         self.running = False
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
         self.motor_interface.close()
 
 

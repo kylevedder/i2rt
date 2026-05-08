@@ -86,7 +86,7 @@ class MotorChainRobot(Robot):
         enable_gripper_calibration: bool = False,  # whether to auto-detect gripper limits
         zero_gravity_mode: bool = True,
         # below are calibration parameters
-        test_torque: float = 0.5,  # test torque for gripper detection (Nm)
+        test_torque: float = 0.2,  # test torque for gripper detection (Nm)
         test_duration: float = 2.0,  # max test duration for each direction (s)
         position_threshold: float = 0.01,  # minimum position change to consider motor still moving (rad)
         check_interval: float = 0.05,  # time interval between checks (s)
@@ -148,13 +148,12 @@ class MotorChainRobot(Robot):
         self.remapper = JointMapper({}, len(motor_chain))  # so it works without gripper
         self._gripper_limits = gripper_limits
         self._gripper_force_limiter: Optional[GripperForceLimiter] = None
-        self._limit_gripper_force: float = -1.0
+        self._limit_gripper_force = limit_gripper_force
 
         if self._gripper_index is not None:
             self._gripper_force_limiter = GripperForceLimiter(
                 max_force=limit_gripper_force, gripper_type=gripper_type, arm_type=arm_type, kp=kp[gripper_index]
             )  # force in newton
-            self._limit_gripper_force = limit_gripper_force
 
             self.remapper = JointMapper(
                 index_range_map={gripper_index: gripper_limits},

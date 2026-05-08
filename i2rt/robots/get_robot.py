@@ -130,6 +130,7 @@ def get_yam_robot(
     channel: str = "can0",
     arm_type: ArmType = ArmType.YAM,
     gripper_type: GripperType = GripperType.LINEAR_4310,
+    use_gravity_comp: bool = True,
     zero_gravity_mode: bool = True,
     ee_mass: Optional[float] = None,
     ee_inertia: Optional[np.ndarray] = None,
@@ -147,6 +148,7 @@ def get_yam_robot(
         channel: CAN interface name (e.g. "can0"). Ignored in sim mode.
         arm_type: Which arm variant to use. Use ``ArmType.NO_ARM`` for gripper-only.
         gripper_type: Which gripper (or NO_GRIPPER / YAM_TEACHING_HANDLE).
+        use_gravity_comp: Whether to add model-based gravity compensation torques.
         zero_gravity_mode: Start in gravity-compensation mode.
         ee_mass: Optional end-effector mass override (kg) for MuJoCo inertial.
         ee_inertia: Optional 10-element inertia override [ipos(3), quat(4), diaginertia(3)].
@@ -268,7 +270,7 @@ def get_yam_robot(
         MotorChainRobot,
         motor_chain=motor_chain,
         xml_path=model_path,
-        use_gravity_comp=True,
+        use_gravity_comp=use_gravity_comp,
         gravity_comp_factor=effective_gravity_comp,
         joint_limits=joint_limits,
         kp=kp,
