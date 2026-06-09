@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 import struct
@@ -33,6 +34,8 @@ CONTROL_PERIOD = 1.0 / CONTROL_FREQ  # 4 ms
 
 EXPECTED_CONTROL_PERIOD = 0.007
 REPORT_INTERVAL = 30.0
+SAME_BUS_DEVICE_RETRY_BACKOFF = 0.5
+SAME_BUS_DEVICE_WARNING_INTERVAL = 5.0
 
 
 class ControlMode:
@@ -88,11 +91,16 @@ class PassiveEncoderReader:
             self.can_interface.channel, encoder_config
         )
 
-    def read_encoder(self, encoder_id: int) -> PassiveEncoderInfo:
+    def read_encoder(self, encoder_id: int, max_retry: int = 15) -> PassiveEncoderInfo:
         # this encoder's trigger message is 0x02
         data = [0xFF, 0x02]
         message = self.can_interface._send_message_get_response(
-            encoder_id, encoder_id, data, expected_id=self.receive_mode.get_receive_id(0x50E), max_retry=15
+            encoder_id,
+            encoder_id,
+            data,
+            expected_id=self.receive_mode.get_receive_id(0x50E),
+            max_retry=max_retry,
+            drain_on_final_failure=False,
         )
         pos, vel, button_state = self._parse_encoder_message(message)
         pos_range = [-self.range_rad, self.range_rad]
@@ -121,8 +129,10 @@ class EncoderChain:
         self.encoder_ids = encoder_ids
         self.encoder_interface = encoder_interface
 
-    def read_states(self) -> List[PassiveEncoderInfo]:
-        return [self.encoder_interface.read_encoder(encoder_id) for encoder_id in self.encoder_ids]
+    def read_states(self, max_retry: int = 15) -> List[PassiveEncoderInfo]:
+        return [
+            self.encoder_interface.read_encoder(encoder_id, max_retry=max_retry) for encoder_id in self.encoder_ids
+        ]
 
 
 class DMSingleMotorCanInterface(CanInterface):
@@ -432,6 +442,8 @@ class DMChainCanInterface(MotorChain):
 
         self.same_bus_device_states = None
         self.same_bus_device_lock = threading.Lock()
+        self._same_bus_device_next_poll_time = 0.0
+        self._same_bus_device_last_warning_time = 0.0
 
         with self.same_bus_device_lock:
             if get_same_bus_device_driver is not None:
@@ -593,22 +605,45 @@ class DMChainCanInterface(MotorChain):
                             continue
                         self.running = False
                         logging.error(f"motor errors: {errors}")
-                        raise Exception("motors have unrecoverable errors after recovery attempts, stopping control loop")
+                        raise Exception(
+                            "motors have unrecoverable errors after recovery attempts, stopping control loop"
+                        )
 
                     with self.state_lock:
                         self.state = motor_feedback
                         self._update_absolute_positions(motor_feedback)
                     if self.same_bus_device_driver is not None:
                         time.sleep(0.001)
-                        with self.same_bus_device_lock:
-                            # assume the same bus device is a passive input device (no commands to send) for now.
-                            self.same_bus_device_states = self.same_bus_device_driver.read_states()
+                        self._poll_same_bus_device()
                     time.sleep(0)  # yield GIL so other threads can acquire locks
                     self._rate_recorder.track()
                 except Exception as e:
                     print(f"DM Error in control loop: {e}")
                     self.running = False
                     raise e
+
+    def _poll_same_bus_device(self) -> None:
+        """Best-effort poll of a passive device sharing the motor CAN bus."""
+        now = time.monotonic()
+        if now < self._same_bus_device_next_poll_time:
+            return
+
+        try:
+            states = self.same_bus_device_driver.read_states(max_retry=1)
+        except Exception as e:
+            self._same_bus_device_next_poll_time = now + SAME_BUS_DEVICE_RETRY_BACKOFF
+            if now - self._same_bus_device_last_warning_time >= SAME_BUS_DEVICE_WARNING_INTERVAL:
+                logging.error(
+                    "Failed to poll passive same-bus device; retaining its last valid state and retrying in %.1fs: %s",
+                    SAME_BUS_DEVICE_RETRY_BACKOFF,
+                    e,
+                )
+                self._same_bus_device_last_warning_time = now
+            return
+
+        self._same_bus_device_next_poll_time = 0.0
+        with self.same_bus_device_lock:
+            self.same_bus_device_states = states
 
     def _try_recover_motors(self, motor_feedback: Optional[List[MotorInfo]] = None, max_retries: int = 3) -> bool:
         """Attempt to recover motors that report errors.
@@ -728,9 +763,19 @@ class DMChainCanInterface(MotorChain):
         if get_state:
             return self.read_states(torques=torques)
 
+    def update_command_velocities(self, updates: Dict[int, float]) -> None:
+        """Atomically update selected motor velocities without replacing unrelated commands."""
+        with self.command_lock:
+            commands = [copy.copy(command) for command in self.commands]
+            for idx, velocity in updates.items():
+                if idx < 0 or idx >= len(commands):
+                    raise IndexError(f"Motor command index {idx} out of range [0, {len(commands)})")
+                commands[idx].vel = float(velocity)
+            self.commands = commands
+
     def get_same_bus_device_states(self) -> Any:
         with self.same_bus_device_lock:
-            return self.same_bus_device_states
+            return copy.deepcopy(self.same_bus_device_states)
 
     def close(self) -> None:
         self.running = False

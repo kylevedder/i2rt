@@ -182,48 +182,14 @@ class VehicleMotorController:
 
     def set_velocities(self, input_dict: Dict[str, Any]) -> None:
         steer_vel, drive_vel = input_dict["steer_vel"], input_dict["drive_vel"]
-        num_motors_in_chain = len(self.motor_interface)
-        num_base_motors = 2 * self.num_casters
-
-        # Build base motor velocities (steer and drive alternating)
-        vels = np.zeros(num_motors_in_chain)
+        updates = {}
         for i in range(self.num_casters):
-            vels[i * 2] = steer_vel[i]  # Steer motor
-            vels[i * 2 + 1] = drive_vel[i]  # Drive motor
-
-        if num_motors_in_chain > num_base_motors:
-            with self.motor_interface.command_lock:
-                current_commands = self.motor_interface.commands
-                if current_commands and len(current_commands) == num_motors_in_chain:
-                    vels[num_base_motors:] = [cmd.vel for cmd in current_commands[num_base_motors:]]
-                elif self.homing_check_callback is not None:
-                    try:
-                        if self.homing_check_callback():
-                            logger.warning(
-                                "Linear rail homing in progress but current_commands unavailable. "
-                                "Linear rail velocity may be set to zero."
-                            )
-                    except Exception as e:
-                        logger.warning(f"Error checking homing status: {e}")
-
-        self.motor_interface.set_commands(
-            torques=np.zeros(num_motors_in_chain),
-            pos=np.zeros(num_motors_in_chain),
-            vel=vels,
-            kp=np.zeros(num_motors_in_chain),
-            kd=2.0 * np.ones(num_motors_in_chain),
-            get_state=False,
-        )
+            updates[i * 2] = steer_vel[i]
+            updates[i * 2 + 1] = drive_vel[i]
+        self.motor_interface.update_command_velocities(updates)
 
     def set_neutral(self) -> None:
-        num_motors_in_chain = len(self.motor_interface)
-        self.motor_interface.set_commands(
-            torques=np.zeros(num_motors_in_chain),
-            pos=np.zeros(num_motors_in_chain),
-            vel=np.zeros(num_motors_in_chain),
-            kp=np.zeros(num_motors_in_chain),
-            kd=0.5 * np.ones(num_motors_in_chain),
-        )
+        self.motor_interface.update_command_velocities({idx: 0.0 for idx in range(len(self.motor_interface))})
 
 
 class CommandType(Enum):
@@ -235,6 +201,41 @@ class CommandType(Enum):
 class FrameType(Enum):
     GLOBAL = "global"
     LOCAL = "local"
+
+
+class TimeoutRemoteCommand:
+    """Thread-safe remote command snapshot for a base with an optional linear rail."""
+
+    def __init__(self, timeout: float = 0.2):
+        self.timeout = timeout
+        self.last_update_time = time.monotonic() - 1000000
+        self.command = np.zeros(4)
+        self.frame = "local"
+        self._lock = threading.Lock()
+
+    def remote_set_target_velocity(self, input_dict: Dict[str, Any]) -> None:
+        target_velocity = np.asarray(input_dict["target_velocity"]).copy()
+        frame = input_dict["frame"]
+        with self._lock:
+            if len(target_velocity) == 3:
+                self.command[:3] = target_velocity
+            else:
+                self.command = target_velocity.copy()
+            self.frame = frame
+            self.last_update_time = time.monotonic()
+
+    def get_valid_command(self) -> Tuple[np.ndarray, str, bool]:
+        """Return one coherent command, frame, and timeout-validity snapshot."""
+        with self._lock:
+            valid = time.monotonic() - self.last_update_time < self.timeout
+            return self.command.copy(), self.frame, valid
+
+    def is_command_valid(self) -> bool:
+        return self.get_valid_command()[2]
+
+    def get_command(self) -> Tuple[np.ndarray, str]:
+        command, frame, _valid = self.get_valid_command()
+        return command, frame
 
 
 class Vehicle(Robot):
@@ -268,6 +269,7 @@ class Vehicle(Robot):
         self.num_dofs = 3  # (x, y, theta)
         self.x = np.zeros(self.num_dofs)
         self.dx = np.zeros(self.num_dofs)
+        self._odometry_reset_generation = 0
 
         # C matrix relating operational space velocities to joint velocities
         self.C = np.zeros((num_motors, self.num_dofs))
@@ -400,8 +402,13 @@ class Vehicle(Robot):
 
             # Update state
             self.update_state()
+            with self._lock:
+                x = self.x.copy()
+                dx = self.dx.copy()
+                odometry_reset_generation = self._odometry_reset_generation
+
             # Global to local frame conversion
-            theta = self.x[2]
+            theta = x[2]
             R = np.array(
                 [
                     [math.cos(theta), math.sin(theta), 0.0],
@@ -427,15 +434,15 @@ class Vehicle(Robot):
                 elif command["type"] == CommandType.POSITION:
                     self.otg_inp.control_interface = ControlInterface.Position
                     self.otg_inp.target_position = target
-                    self.otg_inp.target_velocity = np.zeros_like(self.dx)
+                    self.otg_inp.target_velocity = np.zeros_like(dx)
 
                 self.otg_res = Result.Working
                 disable_motors = False
             # Maintain current pose if command stream is disrupted
             if time.time() - last_command_time > 2.5 * POLICY_CONTROL_PERIOD:
                 self.otg_inp.target_position = self.otg_out.new_position
-                self.otg_inp.target_velocity = np.zeros_like(self.dx)
-                self.otg_inp.current_velocity = self.dx  # Set this to prevent lurch when command stream resumes
+                self.otg_inp.target_velocity = np.zeros_like(dx)
+                self.otg_inp.current_velocity = dx  # Set this to prevent lurch when command stream resumes
                 self.otg_res = Result.Working
                 disable_motors = True
 
@@ -445,11 +452,11 @@ class Vehicle(Robot):
                 if self.otg_inp.control_interface == ControlInterface.Position:
                     self.otg_inp.target_position = self.otg_out.new_position
                 elif self.otg_inp.control_interface == ControlInterface.Velocity:
-                    self.otg_inp.target_velocity = np.zeros_like(self.dx)
+                    self.otg_inp.target_velocity = np.zeros_like(dx)
 
             # Update OTG
             if self.otg_res == Result.Working:
-                self.otg_inp.current_position = self.x
+                self.otg_inp.current_position = x
                 self.otg_res = self.otg.update(self.otg_inp, self.otg_out)
                 self.otg_out.pass_to_input(self.otg_inp)
 
@@ -471,7 +478,20 @@ class Vehicle(Robot):
                     "steer_vel": np.asarray(dq_d[::2], order="C"),
                     "drive_vel": np.asarray(dq_d[1:][::2], order="C"),
                 }
-                self.caster_module_controller.set_velocities(vel_dict)
+                with self._lock:
+                    if odometry_reset_generation != self._odometry_reset_generation:
+                        latest_x = self.x.copy()
+                        latest_dx = self.dx.copy()
+                    else:
+                        # Keep reset_odometry() from returning between the generation check and command publication.
+                        self.caster_module_controller.set_velocities(vel_dict)
+                        continue
+                self.otg_inp.current_position = latest_x
+                self.otg_inp.current_velocity = latest_dx
+                self.otg_inp.target_position = latest_x
+                self.otg_inp.target_velocity = np.zeros_like(latest_dx)
+                self.otg_res = Result.Working
+                continue
 
     def _enqueue_command(self, command_type: CommandType, target: Any, frame: Optional[FrameType] = None) -> None:
         if self.command_queue.full():
@@ -484,15 +504,17 @@ class Vehicle(Robot):
 
     def get_odometry(self, input_dict: Dict[str, Any] | None = None) -> Dict[str, Any]:
         with self._lock:
+            x = self.x.copy()
             return {
-                "translation": self.x[:2],
-                "rotation": self.x[2],
+                "translation": x[:2],
+                "rotation": x[2],
             }
 
     def reset_odometry(self, input_dict: Dict[str, Any] | None = None) -> None:
         with self._lock:
             self.x = np.zeros(self.num_dofs)
             self.dx = np.zeros(self.num_dofs)
+            self._odometry_reset_generation += 1
 
     def set_target_velocity(self, velocity: Any, frame: str = "local") -> None:
         self._enqueue_command(CommandType.VELOCITY, velocity, frame)
@@ -763,42 +785,6 @@ if __name__ == "__main__":
 
     atexit.register(close_vehicle)
 
-    class TimeoutRemoteCommand:
-        """Unified remote command handler for LinearRailVehicle (base + linear rail)"""
-
-        def __init__(self, timeout: float = 0.2):
-            self.timeout = timeout
-            self.last_update_time = time.time() - 1000000
-            self.command = np.zeros(4)  # Support 4D: [x, y, theta, linear_rail]
-            self.frame = "local"
-            self._lock = threading.Lock()
-
-        def is_command_valid(self) -> bool:
-            return time.time() - self.last_update_time < self.timeout
-
-        def remote_set_target_velocity(self, input_dict: Dict[str, Any]) -> None:
-            """Set target velocity for base (and optionally linear rail)"""
-            target_velocity = input_dict["target_velocity"]
-            frame = input_dict["frame"]
-            with self._lock:
-                # If 3D command, only update base part, preserve linear_rail value
-                if len(target_velocity) == 3:
-                    # Ensure command is 4D
-                    if len(self.command) < 4:
-                        self.command = np.append(self.command, 0.0) if len(self.command) == 3 else np.zeros(4)
-                    # Update only base part [x, y, theta], preserve linear_rail
-                    self.command[:3] = target_velocity
-                else:
-                    # 4D command: update everything
-                    self.command = target_velocity
-                self.frame = frame
-                self.last_update_time = time.time()
-
-        def get_command(self) -> Tuple[np.ndarray, str]:
-            """Get base command [x, y, theta, linear_rail] and frame"""
-            with self._lock:
-                return self.command, self.frame
-
     remote_command = TimeoutRemoteCommand()
 
     # setup server for remote calls
@@ -865,10 +851,9 @@ if __name__ == "__main__":
 
             cmd_4d = np.append(gamepad_cmd, lift_vel)
 
-            is_remote_command_valid = remote_command.is_command_valid()
+            user_cmd, user_frame, is_remote_command_valid = remote_command.get_valid_command()
 
             if is_remote_command_valid:
-                user_cmd, user_frame = remote_command.get_command()
                 gamepad_command_override = False
 
                 if gamepad_button["key_left_2"]:

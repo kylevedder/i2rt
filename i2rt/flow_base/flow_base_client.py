@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import logging
 import sys
 import threading
 import time
@@ -9,6 +11,9 @@ import portal
 
 from i2rt.flow_base.flow_base_controller import BASE_DEFAULT_PORT
 
+RPC_TIMEOUT_S = 0.5
+PUBLISH_PERIOD_S = 0.02
+
 
 class FlowBaseClient:
     def __init__(self, host: str = "localhost", with_linear_rail: bool = False):
@@ -17,21 +22,34 @@ class FlowBaseClient:
         self.num_dofs = 3 if not self.with_linear_rail else 4
         self.command = {"target_velocity": np.zeros(self.num_dofs), "frame": "local"}
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
         self.running = True
-        self._thread = threading.Thread(target=self._update_command)
+        self._thread = threading.Thread(target=self._update_command, name="flow_base_command_publisher")
         self._thread.start()
 
     def _update_command(self) -> None:
-        while self.running:
+        while not self._stop_event.is_set():
             with self._lock:
-                self.client.set_target_velocity(self.command).result()
-            time.sleep(0.02)
+                command = {
+                    "target_velocity": self.command["target_velocity"].copy(),
+                    "frame": self.command["frame"],
+                }
+            try:
+                self.client.set_target_velocity(command).result(timeout=RPC_TIMEOUT_S)
+            except Exception:
+                logging.exception("Flow-base command publisher failed; stopping command publication")
+                self.running = False
+                self._stop_event.set()
+                with contextlib.suppress(Exception):
+                    self.client.close(timeout=RPC_TIMEOUT_S)
+                return
+            self._stop_event.wait(PUBLISH_PERIOD_S)
 
     def get_odometry(self) -> Any:
-        return self.client.get_odometry({}).result()
+        return self.client.get_odometry({}).result(timeout=RPC_TIMEOUT_S)
 
     def reset_odometry(self) -> Any:
-        return self.client.reset_odometry({}).result()
+        return self.client.reset_odometry({}).result(timeout=RPC_TIMEOUT_S)
 
     def set_target_velocity(self, target_velocity: np.ndarray, frame: str = "local") -> None:
         """Set target velocity for base and optionally linear rail.
@@ -44,14 +62,14 @@ class FlowBaseClient:
         assert frame in ["local", "global"], "Frame must be either local or global"
 
         with self._lock:
-            self.command["target_velocity"] = target_velocity
+            self.command["target_velocity"] = target_velocity.copy()
             self.command["frame"] = frame
 
     def get_linear_rail_state(self) -> Any:
         """Get the current state of the linear rail."""
         if not self.with_linear_rail:
             raise ValueError("Linear rail not enabled. Initialize FlowBaseClient with with_linear_rail=True")
-        return self.client.get_linear_rail_state({}).result()
+        return self.client.get_linear_rail_state({}).result(timeout=RPC_TIMEOUT_S)
 
     def set_linear_rail_velocity(self, velocity: float) -> None:
         """Set the velocity of the linear rail.
@@ -69,8 +87,13 @@ class FlowBaseClient:
     def close(self) -> None:
         """Stop the client and clean up resources."""
         self.running = False
+        self._stop_event.set()
+        with contextlib.suppress(Exception):
+            self.client.close(timeout=RPC_TIMEOUT_S)
         if self._thread.is_alive():
             self._thread.join(timeout=1.0)
+        if self._thread.is_alive():
+            raise RuntimeError("Flow-base command publisher did not stop after closing the Portal transport")
 
 
 if __name__ == "__main__":

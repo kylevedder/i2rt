@@ -231,15 +231,7 @@ class SimRobot(Robot):
         with self._lock:
             return {"pos": self._qpos.copy(), "vel": self._qvel.copy()}
 
-    def command_joint_pos(self, joint_pos: np.ndarray) -> None:
-        """Command the sim robot to a target joint position.
-
-        When physics is active (sim mode), this disables gravity comp and
-        teleports ``data.qpos`` directly.  Gravity comp stays off for the
-        duration of control mode and is re-enabled when the caller (e.g.
-        ``MujocoControlInterface._on_key``) switches back to VIS mode via
-        ``enable_gravity_comp()``.
-        """
+    def _prepare_joint_pos_command(self, joint_pos: np.ndarray) -> np.ndarray:
         pos = np.array(joint_pos, dtype=float)
         if self._joint_limits is not None:
             arm_end = self._gripper_index if self._gripper_index is not None else len(pos)
@@ -254,15 +246,30 @@ class SimRobot(Robot):
                 min(self._gripper_limits),
                 max(self._gripper_limits),
             )
+        return pos
+
+    def _apply_joint_pos_locked(self, pos: np.ndarray) -> None:
+        if self._physics_active:
+            self._grav_comp_enabled = False
+        self._qpos = pos
+        n = min(len(pos), self._model.nq)
+        mj_qpos = self._cmd_to_mj_qpos(pos)
+        self._data.qpos[:n] = mj_qpos[:n]
+        self._data.qvel[:] = 0.0
+        mujoco.mj_forward(self._model, self._data)
+
+    def command_joint_pos(self, joint_pos: np.ndarray) -> None:
+        """Command the sim robot to a target joint position.
+
+        When physics is active (sim mode), this disables gravity comp and
+        teleports ``data.qpos`` directly.  Gravity comp stays off for the
+        duration of control mode and is re-enabled when the caller (e.g.
+        ``MujocoControlInterface._on_key``) switches back to VIS mode via
+        ``enable_gravity_comp()``.
+        """
+        pos = self._prepare_joint_pos_command(joint_pos)
         with self._lock:
-            if self._physics_active:
-                self._grav_comp_enabled = False
-            self._qpos = pos
-            n = min(len(pos), self._model.nq)
-            mj_qpos = self._cmd_to_mj_qpos(pos)
-            self._data.qpos[:n] = mj_qpos[:n]
-            self._data.qvel[:] = 0.0
-            mujoco.mj_forward(self._model, self._data)
+            self._apply_joint_pos_locked(pos)
             self._update_joint_state()
 
     def command_target_vel(self, joint_vel: np.ndarray) -> None:
@@ -271,9 +278,13 @@ class SimRobot(Robot):
             self._update_joint_state()
 
     def command_joint_state(self, joint_state: Dict[str, np.ndarray]) -> None:
-        self.command_joint_pos(joint_state["pos"])
-        if "vel" in joint_state:
-            self.command_target_vel(joint_state["vel"])
+        pos = self._prepare_joint_pos_command(joint_state["pos"])
+        vel = np.array(joint_state["vel"], dtype=float) if "vel" in joint_state else None
+        with self._lock:
+            self._apply_joint_pos_locked(pos)
+            if vel is not None:
+                self._qvel = vel
+            self._update_joint_state()
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         with self._lock:

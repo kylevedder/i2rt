@@ -4,7 +4,6 @@ import threading
 import time
 from typing import Any, Dict
 
-import numpy as np
 from RPi import GPIO
 
 from i2rt.motor_drivers.dm_driver import DMChainCanInterface
@@ -82,22 +81,7 @@ class SingleMotorControlInterface:
 
     def set_velocity(self, vel: float) -> None:
         """Set motor velocity"""
-        num_motors = len(self.motor_chain)
-
-        velocities = np.zeros(num_motors)
-        velocities[self.target_motor_idx] = vel
-
-        # Preserve velocities of other motors (e.g., base motors) by reading current commands
-        with self.motor_chain.command_lock:
-            current_commands = self.motor_chain.commands
-            if current_commands and len(current_commands) == num_motors:
-                # Preserve velocities of other motors
-                for idx in range(num_motors):
-                    if idx != self.target_motor_idx:
-                        velocities[idx] = current_commands[idx].vel
-
-        torques = np.zeros(num_motors)
-        self.motor_chain.set_commands(torques=torques, vel=velocities, pos=None, kp=None, kd=None, get_state=False)
+        self.motor_chain.update_command_velocities({self.target_motor_idx: vel})
 
     def get_state(self) -> MotorInfo:
         """Get motor state"""
@@ -136,6 +120,7 @@ class LinearRailController:
         self.brake_on = True
 
         self._lock = threading.Lock()
+        self._command_lock = threading.RLock()
         self.upper_limit_triggered = False
         self.lower_limit_triggered = False
         self._gpio_mode_set = False
@@ -159,6 +144,11 @@ class LinearRailController:
             with self._lock:
                 self.initialized = True
             logger.info("Linear rail initialized without auto-homing (GPIO will be initialized separately)")
+
+    def _command_motor_velocity(self, velocity: float) -> None:
+        """Serialize motor command publication without blocking state readers."""
+        with self._command_lock:
+            self.single_motor_control_interface.set_velocity(velocity)
 
     def _ensure_gpio_mode(self) -> None:
         """Ensure GPIO mode is set"""
@@ -246,7 +236,7 @@ class LinearRailController:
 
             if limit_state:
                 logger.warning(f"{limit_name.capitalize()} limit switch triggered!")
-                self.single_motor_control_interface.set_velocity(0.0)
+                self._command_motor_velocity(0.0)
             else:
                 logger.info(f"{limit_name.capitalize()} limit switch released")
         except Exception as e:
@@ -280,10 +270,12 @@ class LinearRailController:
 
             # Check if already at lower limit
             with self._lock:
-                if self.lower_limit_triggered:
-                    logger.info("Linear rail is already at lower limit - ready for operation")
+                already_at_lower_limit = self.lower_limit_triggered
+                if already_at_lower_limit:
                     self.initialized = True
-                    return
+            if already_at_lower_limit:
+                logger.info("Linear rail is already at lower limit - ready for operation")
+                return
 
             # If not at lower limit, start homing
             # Set homing state
@@ -306,24 +298,25 @@ class LinearRailController:
 
                 # Continuously re-apply homing velocity to prevent base controller from overwriting it
                 if current_time - last_velocity_set_time >= velocity_set_interval:
-                    self.single_motor_control_interface.set_velocity(motor_velocity)
+                    self._command_motor_velocity(motor_velocity)
                     last_velocity_set_time = current_time
 
                 with self._lock:
-                    if self.lower_limit_triggered:
-                        # Reached lower limit, stop motor
-                        self.single_motor_control_interface.set_velocity(0.0)
-                        elapsed_time = current_time - start_time
-                        logger.info(f"Homing success! Zero position found in {elapsed_time:.1f}s")
+                    reached_lower_limit = self.lower_limit_triggered
+                    if reached_lower_limit:
                         self._homing_event.clear()
                         self._homing_start_time = None
                         self.initialized = True
-                        return
+                if reached_lower_limit:
+                    self._command_motor_velocity(0.0)
+                    elapsed_time = current_time - start_time
+                    logger.info(f"Homing success! Zero position found in {elapsed_time:.1f}s")
+                    return
 
                 time.sleep(0.01)  # Check every 10ms for faster response
 
             # Timeout
-            self.single_motor_control_interface.set_velocity(0.0)
+            self._command_motor_velocity(0.0)
             with self._lock:
                 self._homing_event.clear()
                 self._homing_start_time = None
@@ -331,15 +324,14 @@ class LinearRailController:
 
         except Exception as e:
             logger.error(f"Linear rail initialization failed: {e}")
-            self.initialized = False
-            self.single_motor_control_interface.set_velocity(0.0)
             with self._lock:
+                self.initialized = False
                 self._homing_event.clear()
+            self._command_motor_velocity(0.0)
             raise  # Re-raise the exception (timeout RuntimeError or other errors)
 
     def _stop_homing(self) -> None:
-        """Stop homing procedure and reset state (assumes lock is held)"""
-        self.single_motor_control_interface.set_velocity(0.0)
+        """Reset homing state (assumes the state lock is held)."""
         self._homing_event.clear()
         self._homing_start_time = None
 
@@ -370,12 +362,22 @@ class LinearRailController:
 
     def set_velocity(self, vel: float) -> None:
         """Set the velocity of the linear rail, unit in rad/s (motor velocity)"""
-        assert self.initialized, "Linear rail must be initialized before setting velocity"
-        assert not self.brake_on, "Brake must be released before setting velocity"
-
-        with self._lock:
+        with self._command_lock:
             current_time = time.time()
-            if current_time - self.last_command_time > self.command_timeout:
+            with self._lock:
+                initialized = self.initialized
+                brake_on = self.brake_on
+                command_timed_out = current_time - self.last_command_time > self.command_timeout
+                self.last_command_time = current_time
+                upper_limit_triggered = self.upper_limit_triggered
+                lower_limit_triggered = self.lower_limit_triggered
+                homing = self._homing_event.is_set()
+                homing_start_time = self._homing_start_time
+
+            assert initialized, "Linear rail must be initialized before setting velocity"
+            assert not brake_on, "Brake must be released before setting velocity"
+
+            if command_timed_out:
                 try:
                     self.single_motor_control_interface.set_velocity(0.0)
                     logger.warning(
@@ -385,20 +387,18 @@ class LinearRailController:
                 except Exception as e:
                     logger.error(f"Failed to stop linear rail on timeout: {e}")
 
-            # Update last command time when receiving a command (command stream active)
-            self.last_command_time = current_time
-
-            if vel > 0.0 and self.upper_limit_triggered:
+            if vel > 0.0 and upper_limit_triggered:
                 logger.warning("Upper limit triggered, cannot move forward")
                 self.single_motor_control_interface.set_velocity(0.0)
                 return
-            if vel < 0.0 and self.lower_limit_triggered:
+            if vel < 0.0 and lower_limit_triggered:
                 logger.warning("Lower limit triggered, cannot move backward")
                 self.single_motor_control_interface.set_velocity(0.0)
-                if self._homing_event.is_set():
-                    elapsed_time = time.time() - self._homing_start_time if self._homing_start_time else 0.0
+                if homing:
+                    elapsed_time = time.time() - homing_start_time if homing_start_time else 0.0
                     logger.info(f"Homing success! Zero position found in {elapsed_time:.1f}s")
-                    self._stop_homing()
+                    with self._lock:
+                        self._stop_homing()
                 return
 
             try:
@@ -412,8 +412,10 @@ class LinearRailController:
     def cleanup(self) -> None:
         """Clean up resources"""
         try:
-            self.single_motor_control_interface.set_velocity(0.0)
-            if self.initialized:
+            self._command_motor_velocity(0.0)
+            with self._lock:
+                initialized = self.initialized
+            if initialized:
                 # Ensure GPIO mode is set before cleanup operations
                 try:
                     self._ensure_gpio_mode()

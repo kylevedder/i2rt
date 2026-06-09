@@ -36,7 +36,13 @@ class CanInterface:
         self.bus.shutdown()
 
     def _send_message_get_response(
-        self, id: int, motor_id: int, data: List[int], max_retry: int = 5, expected_id: Optional[int] = None
+        self,
+        id: int,
+        motor_id: int,
+        data: List[int],
+        max_retry: int = 5,
+        expected_id: Optional[int] = None,
+        drain_on_final_failure: bool = True,
     ) -> can.Message:
         """Send a message over the CAN bus.
 
@@ -48,7 +54,7 @@ class CanInterface:
             can.Message: The message that was sent.
         """
         message = can.Message(arbitration_id=id, data=data, is_extended_id=False)
-        for _ in range(max_retry):
+        for attempt in range(max_retry):
             try:
                 # logging.info("Sending message: %s at %f", message, time.time())
                 self.bus.send(message)
@@ -59,7 +65,8 @@ class CanInterface:
                     expected_id = self.receive_mode.get_receive_id(motor_id)
                 if response and (expected_id == response.arbitration_id):
                     return response
-                self.try_receive_message(id)
+                if drain_on_final_failure or attempt + 1 < max_retry:
+                    self.try_receive_message(id)
             except (can.CanError, AssertionError) as e:
                 logging.warning(e)
                 logging.warning(
