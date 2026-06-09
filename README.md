@@ -68,6 +68,12 @@ q = robot.get_joint_pos()   # shape: (6,)
 robot.command_joint_pos(np.zeros(6))
 ```
 
+Real motorized grippers default to a `0.4 rad` maximum closing position error.
+Override it with `max_gripper_closing_position_error_rad`. Opening uses the
+native position controller unchanged. Closing uses the same position controller
+with its outgoing target clamped relative to the measured position; the
+requested stored command is never rewritten.
+
 ### Leader-follower teleoperation
 
 ```bash

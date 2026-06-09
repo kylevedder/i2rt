@@ -40,6 +40,8 @@ def _bare_robot() -> MotorChainRobot:
     robot._gripper_limits = None
     robot._gripper_force_limiter = None
     robot._limit_gripper_force = -1
+    robot._gripper_closing_position_limiter = None
+    robot._max_gripper_closing_position_error_rad = None
     robot._joint_limits = None
     robot._kp = np.array([10.0, 11.0])
     robot._kd = np.array([1.0, 1.1])
@@ -194,3 +196,16 @@ def test_robot_getters_return_owned_arrays() -> None:
     assert np.array_equal(robot._last_motor_torques, [0.5, 0.6])
     assert np.array_equal(robot._kp, [10.0, 11.0])
     assert np.array_equal(robot._joint_limits, [[-1.0, 1.0], [-2.0, 2.0]])
+
+
+def test_gripper_observation_saturates_endpoint_overshoot_without_mutating_internal_state() -> None:
+    robot = _bare_robot()
+    robot._gripper_index = 1
+
+    for measured, expected in ((-0.00171, 0.0), (1.00171, 1.0)):
+        robot._joint_state = _joint_state((0.5, measured))
+
+        observations = robot.get_observations()
+
+        assert observations["gripper_pos"][0] == expected
+        assert robot._joint_state.pos[1] == measured

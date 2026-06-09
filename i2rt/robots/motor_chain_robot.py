@@ -14,7 +14,14 @@ from i2rt.motor_drivers.dm_driver import (
     PassiveEncoderInfo,
 )
 from i2rt.robots.robot import Robot
-from i2rt.robots.utils import ArmType, GripperForceLimiter, GripperType, JointMapper, detect_gripper_limits
+from i2rt.robots.utils import (
+    ArmType,
+    GripperClosingPositionLimiter,
+    GripperForceLimiter,
+    GripperType,
+    JointMapper,
+    detect_gripper_limits,
+)
 from i2rt.utils.mujoco_utils import MuJoCoKDL
 
 
@@ -93,6 +100,7 @@ class MotorChainRobot(Robot):
         pinned_cpu: int | None = None,
         joint_state_saver_factory: Optional[Callable[[], Any]] = None,
         set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
+        max_gripper_closing_position_error_rad: Optional[float] = None,
     ) -> None:
         # Set up CPU pinning and real-time scheduling if requested
         if pinned_cpu is not None and set_realtime_and_pin_callback is not None:
@@ -145,17 +153,28 @@ class MotorChainRobot(Robot):
             else np.ones(len(motor_chain))
         )
 
-        # variables for gripper effort limiting
+        # Variables for gripper limiting
         self._gripper_index = gripper_index
         self.remapper = JointMapper({}, len(motor_chain))  # so it works without gripper
         self._gripper_limits = gripper_limits
         self._gripper_force_limiter: Optional[GripperForceLimiter] = None
         self._limit_gripper_force = limit_gripper_force
+        self._gripper_closing_position_limiter: Optional[GripperClosingPositionLimiter] = None
+        self._max_gripper_closing_position_error_rad = max_gripper_closing_position_error_rad
+        self._gripper_limit_last_log_time = -float("inf")
+        self._gripper_limit_last_error_time = -float("inf")
 
         if self._gripper_index is not None:
             self._gripper_force_limiter = GripperForceLimiter(
-                max_force=limit_gripper_force, gripper_type=gripper_type, arm_type=arm_type, kp=kp[gripper_index]
-            )  # force in newton
+                max_force=limit_gripper_force,
+                gripper_type=gripper_type,
+                arm_type=arm_type,
+                kp=kp[gripper_index],
+            )
+            if max_gripper_closing_position_error_rad is not None:
+                self._gripper_closing_position_limiter = GripperClosingPositionLimiter(
+                    max_closing_position_error_rad=max_gripper_closing_position_error_rad,
+                )
 
             self.remapper = JointMapper(
                 index_range_map={gripper_index: gripper_limits},
@@ -234,6 +253,12 @@ class MotorChainRobot(Robot):
         self._check_current_qpos_in_joint_limits()
 
         self._last_motor_torques: Optional[np.ndarray] = None
+        if self._gripper_closing_position_limiter is not None:
+            logging.info(
+                "%s: gripper closing position-error cap enabled: max_error=%.4f rad",
+                self,
+                self._max_gripper_closing_position_error_rad,
+            )
         self._stop_event = threading.Event()  # Add a stop event
         self._server_thread = threading.Thread(target=self.start_server, name="robot_server")
         self._server_thread.start()
@@ -311,6 +336,7 @@ class MotorChainRobot(Robot):
         }
         if self._gripper_index is not None:
             info["limit_gripper_effort"] = self._limit_gripper_force
+            info["max_gripper_closing_position_error_rad"] = self._max_gripper_closing_position_error_rad
         return info
 
     def start_server(self) -> None:
@@ -360,29 +386,60 @@ class MotorChainRobot(Robot):
         motor_torques = np.clip(motor_torques, -self._clip_motor_torque, self._clip_motor_torque)
 
         if self._gripper_index is not None:
+            gripper_index = self._gripper_index
+            current_raw_qpos = self.remapper.to_robot_joint_pos_space(joint_state.pos)[gripper_index]
             if self._limit_gripper_force > 0:
-                # Get current gripper state in raw robot joint pos space.
                 gripper_state = {
-                    "target_qpos": joint_commands.pos[self._gripper_index],
-                    "current_qpos": self.remapper.to_robot_joint_pos_space(joint_state.pos)[self._gripper_index],
-                    "current_qvel": joint_state.vel[self._gripper_index],
-                    "current_eff": joint_state.eff[self._gripper_index],
-                    "current_normalized_qpos": joint_state.pos[self._gripper_index],
+                    "target_qpos": joint_commands.pos[gripper_index],
+                    "current_qpos": current_raw_qpos,
+                    "current_qvel": joint_state.vel[gripper_index],
+                    "current_eff": joint_state.eff[gripper_index],
+                    "current_normalized_qpos": joint_state.pos[gripper_index],
                     "target_normalized_qpos": self.remapper.to_command_joint_pos_space(joint_commands.pos)[
-                        self._gripper_index
+                        gripper_index
                     ],
                     "last_command_qpos": last_gripper_command_qpos,
                 }
+                joint_commands.pos[gripper_index] = self._gripper_force_limiter.update(gripper_state)
 
-                joint_commands.pos[self._gripper_index] = self._gripper_force_limiter.update(gripper_state)
-
-            # Add a final clip so the gripper won't be over-adjusted.
-            joint_commands.pos[self._gripper_index] = np.clip(
-                joint_commands.pos[self._gripper_index],
+            joint_commands.pos[gripper_index] = np.clip(
+                joint_commands.pos[gripper_index],
                 min(self._gripper_limits),
                 max(self._gripper_limits),
             )
-            last_gripper_command_qpos = joint_commands.pos[self._gripper_index]
+            if self._gripper_closing_position_limiter is not None:
+                try:
+                    limited_target, was_limited = self._gripper_closing_position_limiter.limit_target(
+                        target_qpos=joint_commands.pos[gripper_index],
+                        current_qpos=current_raw_qpos,
+                        closed_qpos=self._gripper_limits[0],
+                        open_qpos=self._gripper_limits[1],
+                    )
+                    joint_commands.pos[gripper_index] = limited_target
+                    now = time.monotonic()
+                    if was_limited and now - self._gripper_limit_last_log_time >= 5.0:
+                        logging.info(
+                            "%s: limiting gripper closing position error to %.4f rad",
+                            self,
+                            self._max_gripper_closing_position_error_rad,
+                        )
+                        self._gripper_limit_last_log_time = now
+                except Exception as exc:
+                    # Keep the arm loop alive while suppressing the unsafe closing command.
+                    joint_commands.pos[gripper_index] = current_raw_qpos
+                    joint_commands.vel[gripper_index] = 0.0
+                    joint_commands.kp[gripper_index] = 0.0
+                    joint_commands.kd[gripper_index] = 0.0
+                    motor_torques[gripper_index] = 0.0
+                    now = time.monotonic()
+                    if now - self._gripper_limit_last_error_time >= 5.0:
+                        logging.error(
+                            "%s: invalid gripper position-limit calculation; suppressing gripper command: %s",
+                            self,
+                            exc,
+                        )
+                        self._gripper_limit_last_error_time = now
+            last_gripper_command_qpos = joint_commands.pos[gripper_index]
 
         new_joint_state = self._update_joint_state(motor_torques, joint_commands)
         with self._state_lock:
@@ -590,6 +647,7 @@ class MotorChainRobot(Robot):
         Returns:
             Dict[str, np.ndarray]: A dictionary of observations.
         """
+        gripper_saturation_warning = None
         with self._state_lock:
             if self._gripper_index is None:
                 result = {
@@ -598,18 +656,35 @@ class MotorChainRobot(Robot):
                     "joint_eff": self._joint_state.eff.copy(),
                 }
             else:
+                measured_gripper_pos = float(self._joint_state.pos[self._gripper_index])
+                gripper_pos = float(np.clip(measured_gripper_pos, 0.0, 1.0))
+                if gripper_pos != measured_gripper_pos:
+                    now = time.monotonic()
+                    last_warning_time = getattr(self, "_gripper_saturation_last_warning_time", -float("inf"))
+                    if now - last_warning_time >= 5.0:
+                        self._gripper_saturation_last_warning_time = now
+                        gripper_saturation_warning = (measured_gripper_pos, gripper_pos)
                 result = {
                     "joint_pos": self._joint_state.pos[: self._gripper_index].copy(),
                     "joint_vel": self._joint_state.vel[: self._gripper_index].copy(),
                     "joint_eff": self._joint_state.eff[: self._gripper_index].copy(),
-                    "gripper_pos": np.array([self._joint_state.pos[self._gripper_index]]),
+                    "gripper_pos": np.array([gripper_pos]),
                     "gripper_vel": np.array([self._joint_state.vel[self._gripper_index]]),
                     "gripper_eff": np.array([self._joint_state.eff[self._gripper_index]]),
                 }
             if self.temp_record_flag:
                 result["temp_mos"] = self._joint_state.temp_mos.copy()
                 result["temp_rotor"] = self._joint_state.temp_rotor.copy()
-            return result
+        if gripper_saturation_warning is not None:
+            measured_gripper_pos, gripper_pos = gripper_saturation_warning
+            logging.warning(
+                "%s: measured normalized gripper position %.6g outside [0, 1]; "
+                "saturating public observation to %.6g",
+                self,
+                measured_gripper_pos,
+                gripper_pos,
+            )
+        return result
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         """Exit the runtime context related to this object."""

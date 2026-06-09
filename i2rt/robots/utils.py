@@ -679,6 +679,41 @@ class GripperForceLimiter:
             return gripper_state["target_qpos"]
 
 
+class GripperClosingPositionLimiter:
+    """Clamp only the outgoing closing target to a fixed position error."""
+
+    def __init__(self, max_closing_position_error_rad: float) -> None:
+        if not np.isfinite(max_closing_position_error_rad) or max_closing_position_error_rad <= 0:
+            raise ValueError(
+                "max_closing_position_error_rad must be positive and finite, "
+                f"got {max_closing_position_error_rad}"
+            )
+        self.max_closing_position_error_rad = float(max_closing_position_error_rad)
+
+    def limit_target(
+        self,
+        *,
+        target_qpos: float,
+        current_qpos: float,
+        closed_qpos: float,
+        open_qpos: float,
+    ) -> tuple[float, bool]:
+        values = (target_qpos, current_qpos, closed_qpos, open_qpos)
+        if not all(np.isfinite(value) for value in values):
+            raise ValueError(f"Gripper position limiter received non-finite command/state values: {values}")
+
+        closing_direction = float(np.sign(closed_qpos - open_qpos))
+        if closing_direction == 0:
+            raise ValueError(f"Gripper closed/open positions must differ, got {closed_qpos} and {open_qpos}")
+
+        requested_closing_error = closing_direction * (target_qpos - current_qpos)
+        if requested_closing_error <= self.max_closing_position_error_rad:
+            return target_qpos, False
+
+        limited_target_qpos = current_qpos + closing_direction * self.max_closing_position_error_rad
+        return limited_target_qpos, True
+
+
 def detect_gripper_limits(
     motor_chain: DMChainCanInterface,
     gripper_index: int,

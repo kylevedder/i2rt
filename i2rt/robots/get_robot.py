@@ -22,6 +22,7 @@ from i2rt.robots.utils import (
 )
 
 logger = logging.getLogger(__name__)
+DEFAULT_MAX_GRIPPER_CLOSING_POSITION_ERROR_RAD = 0.4
 
 
 def _load_joint_limits_from_xml(*xml_paths: str) -> np.ndarray:
@@ -61,6 +62,7 @@ def get_encoder_chain(can_interface: CanInterface) -> EncoderChain:
 def _get_gripper_only_robot(
     channel: str = "can0",
     gripper_type: GripperType = GripperType.LINEAR_4310,
+    max_gripper_closing_position_error_rad: float = DEFAULT_MAX_GRIPPER_CLOSING_POSITION_ERROR_RAD,
     sim: bool = False,
 ) -> "Robot":
     """Create a gripper-only robot (no arm).
@@ -68,10 +70,18 @@ def _get_gripper_only_robot(
     Args:
         channel: CAN interface name (e.g. "can0"). Ignored in sim mode.
         gripper_type: Which gripper to load. Must not be NO_GRIPPER.
+        max_gripper_closing_position_error_rad: Maximum outgoing closing target error in radians.
         sim: If True, return a SimRobot instead of connecting to real hardware.
     """
     if gripper_type == GripperType.NO_GRIPPER:
         raise ValueError("gripper_type cannot be NO_GRIPPER when arm_type is NO_ARM")
+    if not sim and (
+        not np.isfinite(max_gripper_closing_position_error_rad) or max_gripper_closing_position_error_rad <= 0
+    ):
+        raise ValueError(
+            "max_gripper_closing_position_error_rad must be positive and finite, "
+            f"got {max_gripper_closing_position_error_rad}"
+        )
 
     xml_path = gripper_type.get_xml_path()
     # One motor drives the gripper; extra XML joints are coupled via equality constraints.
@@ -122,6 +132,7 @@ def _get_gripper_only_robot(
         enable_gripper_calibration=gripper_needs_cal,
         gripper_type=gripper_type,
         arm_type=nominal_arm,
+        max_gripper_closing_position_error_rad=max_gripper_closing_position_error_rad,
         zero_gravity_mode=False,
     )
 
@@ -141,6 +152,7 @@ def get_yam_robot(
     sim: bool = False,
     joint_state_saver_factory: Optional[Callable[[], Any]] = None,
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
+    max_gripper_closing_position_error_rad: float = DEFAULT_MAX_GRIPPER_CLOSING_POSITION_ERROR_RAD,
 ) -> "Robot":
     """Create a YAM-family robot (real or sim).
 
@@ -157,14 +169,27 @@ def get_yam_robot(
         gripper_limits_override: Optional [closed, open] limits. If provided, skips calibration.
         gripper_kp: Optional gripper kp override. Defaults to gripper_type's default.
         gripper_kd: Optional gripper kd override. Defaults to gripper_type's default.
+        max_gripper_closing_position_error_rad: Maximum outgoing closing target error in radians.
         sim: If True, return a SimRobot instead of connecting to real hardware.
     """
     # --- Gripper-only path (no arm) -------------------------------------------
     if arm_type == ArmType.NO_ARM:
-        return _get_gripper_only_robot(channel=channel, gripper_type=gripper_type, sim=sim)
+        return _get_gripper_only_robot(
+            channel=channel,
+            gripper_type=gripper_type,
+            max_gripper_closing_position_error_rad=max_gripper_closing_position_error_rad,
+            sim=sim,
+        )
 
     with_gripper = gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
     with_teaching_handle = gripper_type == GripperType.YAM_TEACHING_HANDLE
+    if with_gripper and not sim and (
+        not np.isfinite(max_gripper_closing_position_error_rad) or max_gripper_closing_position_error_rad <= 0
+    ):
+        raise ValueError(
+            "max_gripper_closing_position_error_rad must be positive and finite, "
+            f"got {max_gripper_closing_position_error_rad}"
+        )
 
     hw = _load_arm_config(arm_type)
     effective_gravity_comp = hw.gravity_comp_factor if gravity_comp_factor is None else gravity_comp_factor
@@ -289,6 +314,6 @@ def get_yam_robot(
             enable_gripper_calibration=gripper_needs_cal,
             gripper_type=gripper_type,
             arm_type=arm_type,
-            limit_gripper_force=50.0,
+            max_gripper_closing_position_error_rad=max_gripper_closing_position_error_rad,
         )
     return get_robot()
