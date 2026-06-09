@@ -566,34 +566,34 @@ class DMChainCanInterface(MotorChain):
                         max_step_time = 0.0
                         report_start_time = curr_time
 
-                    # Update state
+                    # Snapshot commands without holding the lock across synchronous CAN I/O.
+                    # set_commands replaces the command list, so this reference remains stable.
                     with self.command_lock:
-                        try:
-                            motor_feedback = self._set_commands(self.commands)
-                        except RuntimeError as e:
-                            if "Motor error detected" in str(e):
-                                logging.warning(f"Motor error in control loop, attempting recovery: {e}")
-                                recovered = self._try_recover_motors()
-                                if recovered:
-                                    logging.warning("Motor recovery successful, continuing control loop")
-                                    continue
-                                else:
-                                    self.running = False
-                                    raise
-                            raise
-
-                        errors = np.array([motor_feedback[i].error_code != "0x1" for i in range(len(motor_feedback))])
-                        if np.any(errors):
-                            logging.warning(f"Motor errors detected in feedback: {errors}")
-                            recovered = self._try_recover_motors(motor_feedback)
+                        commands = self.commands
+                    try:
+                        motor_feedback = self._set_commands(commands)
+                    except RuntimeError as e:
+                        if "Motor error detected" in str(e):
+                            logging.warning(f"Motor error in control loop, attempting recovery: {e}")
+                            recovered = self._try_recover_motors()
                             if recovered:
                                 logging.warning("Motor recovery successful, continuing control loop")
                                 continue
-                            self.running = False
-                            logging.error(f"motor errors: {errors}")
-                            raise Exception(
-                                "motors have unrecoverable errors after recovery attempts, stopping control loop"
-                            )
+                            else:
+                                self.running = False
+                                raise
+                        raise
+
+                    errors = np.array([motor_feedback[i].error_code != "0x1" for i in range(len(motor_feedback))])
+                    if np.any(errors):
+                        logging.warning(f"Motor errors detected in feedback: {errors}")
+                        recovered = self._try_recover_motors(motor_feedback)
+                        if recovered:
+                            logging.warning("Motor recovery successful, continuing control loop")
+                            continue
+                        self.running = False
+                        logging.error(f"motor errors: {errors}")
+                        raise Exception("motors have unrecoverable errors after recovery attempts, stopping control loop")
 
                     with self.state_lock:
                         self.state = motor_feedback
@@ -642,13 +642,14 @@ class DMChainCanInterface(MotorChain):
             time.sleep(0.01)
             try:
                 with self.command_lock:
-                    motor_feedback = self._set_commands(self.commands)
-                    if all(fb.error_code == "0x1" for fb in motor_feedback):
-                        logging.warning("All motors recovered successfully")
-                        with self.state_lock:
-                            self.state = motor_feedback
-                            self._update_absolute_positions(motor_feedback)
-                        return True
+                    commands = self.commands
+                motor_feedback = self._set_commands(commands)
+                if all(fb.error_code == "0x1" for fb in motor_feedback):
+                    logging.warning("All motors recovered successfully")
+                    with self.state_lock:
+                        self.state = motor_feedback
+                        self._update_absolute_positions(motor_feedback)
+                    return True
             except RuntimeError:
                 continue
 
